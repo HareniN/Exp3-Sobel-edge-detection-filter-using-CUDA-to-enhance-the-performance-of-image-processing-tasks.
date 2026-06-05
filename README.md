@@ -37,6 +37,14 @@ Discuss the differences in execution time and output quality.
 
 ## PROGRAM:
 ```
+!nvidia-smi
+```
+
+```
+!apt-get install -y nvidia-cuda-toolkit
+```
+
+```
 !nvcc --version
 ```
 
@@ -47,64 +55,46 @@ Discuss the differences in execution time and output quality.
 
 ```
 %%writefile sobelEdgeDetectionFilter.cu
-
-#include <iostream>
-#include <opencv2/opencv.hpp>
-#include <cuda_runtime.h>
-#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <cuda_runtime.h>
+#include <opencv2/opencv.hpp>
 
 using namespace cv;
 
-__global__ void sobelFilter(unsigned char *srcImage,
-                            unsigned char *dstImage,
-                            unsigned int width,
-                            unsigned int height) {
+__global__ void sobelFilter(unsigned char *srcImage, unsigned char *dstImage,
+                            int width, int height) {
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x > 0 && x < width - 1 &&
-        y > 0 && y < height - 1) {
+    if (x > 0 && x < width-1 && y > 0 && y < height-1) {
 
-        int gx = 0;
-        int gy = 0;
+        int Gx[3][3] = {{-1,0,1},{-2,0,2},{-1,0,1}};
+        int Gy[3][3] = {{1,2,1},{0,0,0},{-1,-2,-1}};
 
-        gx = -srcImage[(y - 1) * width + (x - 1)]
-             -2 * srcImage[y * width + (x - 1)]
-             -srcImage[(y + 1) * width + (x - 1)]
-             +srcImage[(y - 1) * width + (x + 1)]
-             +2 * srcImage[y * width + (x + 1)]
-             +srcImage[(y + 1) * width + (x + 1)];
+        int sumX = 0, sumY = 0;
 
-        gy = -srcImage[(y - 1) * width + (x - 1)]
-             -2 * srcImage[(y - 1) * width + x]
-             -srcImage[(y - 1) * width + (x + 1)]
-             +srcImage[(y + 1) * width + (x - 1)]
-             +2 * srcImage[(y + 1) * width + x]
-             +srcImage[(y + 1) * width + (x + 1)];
+        for(int i=-1;i<=1;i++){
+            for(int j=-1;j<=1;j++){
+                unsigned char pixel =
+                    srcImage[(y+i)*width + (x+j)];
+                sumX += pixel * Gx[i+1][j+1];
+                sumY += pixel * Gy[i+1][j+1];
+            }
+        }
 
-        int magnitude = sqrtf((gx * gx) + (gy * gy));
+        int magnitude = (int)sqrtf((float)(sumX*sumX + sumY*sumY));
+        magnitude = fminf(fmaxf(magnitude, 0.0f), 255.0f);
 
-        if (magnitude > 255)
-            magnitude = 255;
-
-        dstImage[y * width + x] = (unsigned char)magnitude;
-    }
-}
-
-void checkCudaErrors(cudaError_t r) {
-    if (r != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: %s\n",
-                cudaGetErrorString(r));
-        exit(EXIT_FAILURE);
+        dstImage[y*width + x] = (unsigned char)magnitude;
     }
 }
 
 int main() {
 
-    Mat image = imread("/content/pca.jpg",
-                       IMREAD_GRAYSCALE);
+    cv::Mat image = imread("/content/pca.jpg", IMREAD_GRAYSCALE);
 
     if (image.empty()) {
         printf("Error: Image not found.\n");
@@ -113,85 +103,41 @@ int main() {
 
     int width = image.cols;
     int height = image.rows;
-
-    size_t imageSize =
-        width * height * sizeof(unsigned char);
+    size_t imageSize = width * height * sizeof(unsigned char);
 
     unsigned char *h_outputImage =
-        (unsigned char *)malloc(imageSize);
+        (unsigned char*)malloc(imageSize);
 
-    unsigned char *d_inputImage,
-                  *d_outputImage;
+    unsigned char *d_inputImage, *d_outputImage;
 
-    checkCudaErrors(cudaMalloc(&d_inputImage,
-                               imageSize));
+    cudaMalloc(&d_inputImage, imageSize);
+    cudaMalloc(&d_outputImage, imageSize);
 
-    checkCudaErrors(cudaMalloc(&d_outputImage,
-                               imageSize));
+    cudaMemcpy(d_inputImage, image.data,
+               imageSize, cudaMemcpyHostToDevice);
 
-    checkCudaErrors(cudaMemcpy(d_inputImage,
-                               image.data,
-                               imageSize,
-                               cudaMemcpyHostToDevice));
+    dim3 blockSize(16,16);
+    dim3 gridSize((width + 15)/16, (height + 15)/16);
 
-    cudaEvent_t start, stop;
+    sobelFilter<<<gridSize, blockSize>>>(d_inputImage,
+                                        d_outputImage,
+                                        width, height);
 
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    cudaMemcpy(h_outputImage, d_outputImage,
+               imageSize, cudaMemcpyDeviceToHost);
 
-    dim3 blockSize(16, 16);
+    cv::Mat outputImage(height, width, CV_8UC1, h_outputImage);
 
-    dim3 gridSize((width + 15) / 16,
-                  (height + 15) / 16);
+    imwrite("output_sobel.jpeg", outputImage);
 
-    cudaEventRecord(start);
-
-    sobelFilter<<<gridSize, blockSize>>>(
-        d_inputImage,
-        d_outputImage,
-        width,
-        height);
-
-    cudaEventRecord(stop);
-
-    cudaEventSynchronize(stop);
-
-    float milliseconds = 0;
-
-    cudaEventElapsedTime(&milliseconds,
-                         start,
-                         stop);
-
-    checkCudaErrors(cudaMemcpy(h_outputImage,
-                               d_outputImage,
-                               imageSize,
-                               cudaMemcpyDeviceToHost));
-
-    Mat outputImage(height,
-                    width,
-                    CV_8UC1,
-                    h_outputImage);
-
-    imwrite("/content/output_sobel.jpeg",
-            outputImage);
+    printf("Edge detection completed.\n");
 
     free(h_outputImage);
-
     cudaFree(d_inputImage);
     cudaFree(d_outputImage);
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    printf("Total time taken: %f milliseconds\n",
-           milliseconds);
-
     return 0;
 }
-```
-
-```
-!ls /content/
 ```
 
 ```
@@ -203,18 +149,9 @@ int main() {
 ```
 
 ```
-import cv2
-from matplotlib import pyplot as plt
+from IPython.display import Image, display
 
-output_image = cv2.imread(
-    '/content/output_sobel.jpeg',
-    cv2.IMREAD_GRAYSCALE
-)
-
-plt.imshow(output_image, cmap='gray')
-plt.title('Edge Detection Output')
-plt.axis('off')
-plt.show()
+display(Image(filename="output_sobel.jpeg"))
 ```
 
 ## OUTPUT:
